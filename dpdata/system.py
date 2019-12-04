@@ -1,4 +1,6 @@
+#%%
 import os
+import glob
 import numpy as np
 import dpdata.lammps.lmp
 import dpdata.lammps.dump
@@ -7,8 +9,10 @@ import dpdata.vasp.xml
 import dpdata.vasp.outcar
 import dpdata.deepmd.raw
 import dpdata.deepmd.comp
-import dpdata.pwscf.traj
-import dpdata.pwscf.scf
+import dpdata.qe.traj
+import dpdata.qe.scf
+import dpdata.siesta.output
+import dpdata.siesta.aiMD_output
 import dpdata.md.pbc
 import dpdata.gaussian.log
 import dpdata.cp2k.output
@@ -16,6 +20,7 @@ from copy import deepcopy
 from monty.json import MSONable
 from monty.serialization import loadfn,dumpfn
 from dpdata.periodic_table import Element
+from dpdata.xyz.quip_gap_xyz import QuipGapxyzSystems
 
 class System (MSONable) :
     '''
@@ -64,8 +69,9 @@ class System (MSONable) :
                 - ``deepmd/raw``: deepmd-kit raw
                 - ``deepmd/npy``: deepmd-kit compressed format (numpy binary)
                 - ``vasp/poscar``: vasp POSCAR
-                - ``pwscf/traj``: pwscf trajectory files. should have: file_name+'.in' and file_name+'.pos'
-
+                - ``qe/cp/traj``: Quantum Espresso CP trajectory files. should have: file_name+'.in' and file_name+'.pos'
+                - ``siesta/output``: siesta SCF output file
+                - ``siesta/aimd_output``: siesta aimd output file
         type_map : list of str
             Needed by formats lammps/lmp and lammps/dump. Maps atom type to name. The atom with type `ii` is mapped to `type_map[ii]`.
             If not provided the atom names are assigned to `'Type_1'`, `'Type_2'`, `'Type_3'`...
@@ -102,8 +108,12 @@ class System (MSONable) :
             self.from_deepmd_raw(file_name, type_map = type_map)
         elif fmt == 'deepmd/npy':
             self.from_deepmd_comp(file_name, type_map = type_map)
-        elif fmt == 'pwscf/traj':
-            self.from_pwscf_traj(file_name, begin = begin, step = step)
+        elif fmt == 'qe/cp/traj':
+            self.from_qe_cp_traj(file_name, begin = begin, step = step)
+        elif fmt.lower() == 'siesta/output':
+            self.from_siesta_output(file_name)
+        elif fmt.lower() == 'siesta/aimd_output':
+            self.from_siesta_aiMD_output(file_name)
         else :
             raise RuntimeError('unknow data format ' + fmt)
 
@@ -272,8 +282,8 @@ class System (MSONable) :
         tmp = System()
         for ii in ['atom_numbs', 'atom_names', 'atom_types', 'orig'] :
             tmp.data[ii] = self.data[ii]
-        tmp.data['cells'] = self.data['cells'][f_idx]
-        tmp.data['coords'] = self.data['coords'][f_idx]
+        tmp.data['cells'] = self.data['cells'][f_idx].reshape(-1, 3, 3)
+        tmp.data['coords'] = self.data['coords'][f_idx].reshape(-1, self.data['coords'].shape[1], 3)
         return tmp
 
 
@@ -305,8 +315,8 @@ class System (MSONable) :
         for ii in ['atom_numbs', 'atom_names'] :
             assert(system.data[ii] == self.data[ii])
         for ii in ['atom_types','orig'] :
-            eq = (system.data[ii] == self.data[ii])
-            assert(eq.all())
+            eq = [v1==v2 for v1,v2 in zip(system.data[ii], self.data[ii])]
+            assert(all(eq))
         for ii in ['coords', 'cells'] :
             self.data[ii] = np.concatenate((self.data[ii], system[ii]), axis = 0)
         return True
@@ -458,11 +468,11 @@ class System (MSONable) :
             fp.write(w_str)
 
 
-    def from_pwscf_traj(self,
+    def from_qe_cp_traj(self,
                         prefix,
                         begin = 0,
                         step = 1) :
-        self.data = dpdata.pwscf.traj.to_system_data(prefix + '.in', prefix, begin = begin, step = step)
+        self.data = dpdata.qe.traj.to_system_data(prefix + '.in', prefix, begin = begin, step = step)
         self.data['coords'] \
             = dpdata.md.pbc.apply_pbc(self.data['coords'],
                                       self.data['cells'],
@@ -506,6 +516,25 @@ class System (MSONable) :
         """
         dpdata.deepmd.raw.dump(folder, self.data) 
 
+    def from_siesta_output(self, fname):
+        self.data['atom_names'], \
+        self.data['atom_numbs'], \
+        self.data['atom_types'], \
+        self.data['cells'], \
+        self.data['coords'], \
+        _e, _f, _v \
+            = dpdata.siesta.output.obtain_frame(fname)
+        # self.rot_lower_triangular()
+
+    def from_siesta_aiMD_output(self, fname):
+        self.data['atom_names'], \
+        self.data['atom_numbs'], \
+        self.data['atom_types'], \
+        self.data['cells'], \
+        self.data['coords'], \
+        _e, _f, _v \
+            = dpdata.siesta.aiMD_output.get_aiMD_frame(fname)
+    
     def affine_map(self, trans, f_idx = 0) :
         assert(np.linalg.det(trans) != 0)
         self.data['cells'][f_idx] = np.matmul(self.data['cells'][f_idx], trans)
@@ -586,9 +615,13 @@ class LabeledSystem (System):
                 - ``vasp/outcar``: vasp OUTCAR
                 - ``deepmd/raw``: deepmd-kit raw
                 - ``deepmd/npy``: deepmd-kit compressed format (numpy binary)
-                - ``pwscf/traj``: pwscf trajectory files. should have: file_name+'.in', file_name+'.pos', file_name+'.evp' and file_name+'.for'
-                - ``pwscf/scf``: pwscf single point calculations. Both input and output files are required. file_name denotes output file name. Input file name is obtained by replacing 'out' by 'in' from file_name.
+                - ``qe/cp/traj``: Quantum Espresso CP trajectory files. should have: file_name+'.in', file_name+'.pos', file_name+'.evp' and file_name+'.for'
+                - ``qe/pw/scf``: Quantum Espresso PW single point calculations. Both input and output files are required. If file_name is a string, it denotes the output file name. Input file name is obtained by replacing 'out' by 'in' from file_name. Or file_name is a list, with the first element being the input file name and the second element being the output filename.
+                - ``siesta/output``: siesta SCF output file
+                - ``siesta/aimd_output``: siesta aimd output file
                 - ``gaussian/log``: gaussian logs
+                - ``gaussian/md``: gaussian ab initio molecular dynamics
+                - ``cp2k/output``: cp2k output file
 
         type_map : list of str
             Needed by formats deepmd/raw and deepmd/npy. Maps atom type to name. The atom with type `ii` is mapped to `type_map[ii]`.
@@ -617,10 +650,14 @@ class LabeledSystem (System):
             self.from_deepmd_raw(file_name, type_map = type_map)
         elif fmt == 'deepmd/npy':
             self.from_deepmd_comp(file_name, type_map = type_map)
-        elif fmt == 'pwscf/traj':
-            self.from_pwscf_traj(file_name, begin = begin, step = step)
-        elif fmt == 'pwscf/scf':
-            self.from_pwscf_scf(file_name)
+        elif fmt == 'qe/cp/traj':
+            self.from_qe_cp_traj(file_name, begin = begin, step = step)
+        elif fmt == 'qe/pw/scf':
+            self.from_qe_pw_scf(file_name)
+        elif fmt.lower() == 'siesta/output':
+            self.from_siesta_output(file_name)
+        elif fmt.lower() == 'siesta/aimd_output':
+            self.from_siesta_aiMD_output(file_name)
         elif fmt == 'gaussian/log':
             self.from_gaussian_log(file_name)
         elif fmt == 'gaussian/md':
@@ -747,17 +784,17 @@ class LabeledSystem (System):
             self.data = tmp_data
 
 
-    def from_pwscf_traj(self, prefix, begin = 0, step = 1) :
-        self.data = dpdata.pwscf.traj.to_system_data(prefix + '.in', prefix, begin = begin, step = step)
+    def from_qe_cp_traj(self, prefix, begin = 0, step = 1) :
+        self.data = dpdata.qe.traj.to_system_data(prefix + '.in', prefix, begin = begin, step = step)
         self.data['coords'] \
             = dpdata.md.pbc.apply_pbc(self.data['coords'],
                                       self.data['cells'],
             )
         self.data['energies'], self.data['forces'] \
-            = dpdata.pwscf.traj.to_system_label(prefix + '.in', prefix, begin = begin, step = step)
+            = dpdata.qe.traj.to_system_label(prefix + '.in', prefix, begin = begin, step = step)
         self.rot_lower_triangular()
 
-    def from_pwscf_scf(self, file_name) :
+    def from_qe_pw_scf(self, file_name) :
         self.data['atom_names'], \
             self.data['atom_numbs'], \
             self.data['atom_types'], \
@@ -766,9 +803,32 @@ class LabeledSystem (System):
             self.data['energies'], \
             self.data['forces'], \
             self.data['virials'], \
-            = dpdata.pwscf.scf.get_frame(file_name)
+            = dpdata.qe.scf.get_frame(file_name)
         self.rot_lower_triangular()
+    
+    def from_siesta_output(self, file_name) :
+        self.data['atom_names'], \
+        self.data['atom_numbs'], \
+        self.data['atom_types'], \
+        self.data['cells'], \
+        self.data['coords'], \
+        self.data['energies'], \
+        self.data['forces'], \
+        self.data['virials'] \
+            = dpdata.siesta.output.obtain_frame(file_name)
+        # self.rot_lower_triangular()
 
+    def from_siesta_aiMD_output(self, file_name):
+        self.data['atom_names'], \
+        self.data['atom_numbs'], \
+        self.data['atom_types'], \
+        self.data['cells'], \
+        self.data['coords'], \
+        self.data['energies'], \
+        self.data['forces'], \
+        self.data['virials'] \
+            = dpdata.siesta.aiMD_output.get_aiMD_frame(file_name)
+    
     def from_gaussian_log(self, file_name, md=False):
         try:
             self.data = dpdata.gaussian.log.to_system_data(file_name, md=md)
@@ -803,10 +863,10 @@ class LabeledSystem (System):
         """
         tmp_sys = LabeledSystem()
         tmp_sys.data = System.sub_system(self, f_idx).data
-        tmp_sys.data['energies'] = self.data['energies'][f_idx]
-        tmp_sys.data['forces'] = self.data['forces'][f_idx]
+        tmp_sys.data['energies'] = np.atleast_1d(self.data['energies'][f_idx])
+        tmp_sys.data['forces'] = self.data['forces'][f_idx].reshape(-1, self.data['forces'].shape[1], 3)
         if 'virials' in self.data:
-            tmp_sys.data['virials'] = self.data['virials'][f_idx]
+            tmp_sys.data['virials'] = self.data['virials'][f_idx].reshape(-1, 3, 3)
         return tmp_sys
 
 
@@ -846,7 +906,7 @@ class LabeledSystem (System):
 class MultiSystems:
     '''A set containing several systems.'''
 
-    def __init__(self, *systems, type_map=None):
+    def __init__(self, *systems,type_map=None):
         """
         Parameters
         ----------
@@ -885,6 +945,31 @@ class MultiSystems:
        elif isinstance(others, list):
           return self.__class__(self, *others)
        raise RuntimeError("Unspported data structure")
+    
+    @classmethod
+    def from_file(cls,file_name,fmt):
+        multi_systems = cls()
+        multi_systems.load_systems_from_file(file_name=file_name,fmt=fmt)
+        return multi_systems
+
+    @classmethod
+    def from_dir(cls,dir_name, file_name, fmt='auto'):
+        multi_systems = cls()
+        target_file_list = glob.glob('./{}/**/{}'.format(dir_name, file_name), recursive=True)
+        for target_file in target_file_list:
+            multi_systems.append(LabeledSystem(file_name=target_file, fmt=fmt))
+        return multi_systems
+
+
+    def load_systems_from_file(self, file_name=None, fmt=None):
+        if file_name is not None:
+            if fmt is None:
+                raise RuntimeError("must specify file format for file {}".format(file_name))
+            elif fmt == 'quip/gap/xyz' or 'xyz':
+                self.from_quip_gap_xyz_file(file_name)
+            else:
+                raise RuntimeError("unknown file format for file {} format {},now supported 'quip/gap/xyz'".format(file_name, fmt))
+
 
     def get_nframes(self) :
         """Returns number of frames in all systems"""
@@ -939,6 +1024,14 @@ class MultiSystems:
             # Previous atom_name not in this system
             system.add_atom_names(new_in_self)
         system.sort_atom_names()
+
+    def from_quip_gap_xyz_file(self,file_name):
+        # quip_gap_xyz_systems = QuipGapxyzSystems(file_name)
+        # print(next(quip_gap_xyz_systems))
+        for info_dict in QuipGapxyzSystems(file_name):
+            system=LabeledSystem(data=info_dict)
+            self.append(system)
+
 
     def to_deepmd_raw(self, folder) :
         """
@@ -996,9 +1089,12 @@ def check_LabeledSystem(data):
 
 def elements_index_map(elements,standard=False,inverse=False):
     if standard:
-       elements.sort(key=lambda x: Element(x).Z)
+        elements.sort(key=lambda x: Element(x).Z)
     if inverse:
-       return dict(zip(range(len(elements)),elements))
+        return dict(zip(range(len(elements)),elements))
     else:
-       return dict(zip(elements,range(len(elements))))
+        return dict(zip(elements,range(len(elements))))
 
+
+
+# %%
